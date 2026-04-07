@@ -38,85 +38,13 @@ public class BmwSecuritySystem extends SecuritySystem {
                 "Immobilizer Status Read",
                 "Alarm Configuration",
                 "Keyless Entry Configuration",
-                "Tilt Sensor Sensitivity"
+                "Tilt Sensor Toggle"
         );
     }
 
     @Override
     public String getSystemInfo() {
         return "BMW CAS Security System - Engineering level access via CAN 0x640/0x648";
-    }
-
-    @Override
-    public List<String> readRegisteredKeys() throws IOException {
-        EcuConnection conn = connections.get(CAS_ID);
-        List<String> keys = new ArrayList<>();
-
-        for (int slot = 1; slot <= 4; slot++) {
-            int did = 0xD000 + slot;
-            conn.getProtocol().sendRequest(buildReadDid(did));
-            byte[] response = conn.getProtocol().readResponse();
-
-            if (response.length > 3 && response[3] != 0x00) {
-                StringBuilder keyId = new StringBuilder();
-                for (int i = 3; i < response.length; i++) {
-                    keyId.append(String.format("%02X", response[i] & 0xFF));
-                }
-                keys.add("Slot " + slot + ": Key ID " + keyId.toString());
-            } else {
-                keys.add("Slot " + slot + ": Empty");
-            }
-        }
-        return keys;
-    }
-
-    @Override
-    public void programKey(byte[] keyData) throws IOException {
-        EcuConnection conn = connections.get(CAS_ID);
-
-        // Enter programming session
-        conn.getProtocol().sendRequest(new byte[]{0x10, 0x02});
-        conn.getProtocol().readResponse();
-
-        // Engineering-level security access (0x61/0x62)
-        conn.getProtocol().sendRequest(new byte[]{0x27, 0x61});
-        byte[] seedResponse = conn.getProtocol().readResponse();
-
-        // Key programming requires engineering seed/key exchange
-        // In a real implementation, the seed would be processed by BmwSeedKeyAlgorithm
-        conn.getProtocol().sendRequest(new byte[]{0x27, 0x62, 0x00, 0x00, 0x00, 0x00});
-        conn.getProtocol().readResponse();
-
-        // Write key data via routine control
-        byte[] request = new byte[4 + keyData.length];
-        request[0] = 0x31; // RoutineControl
-        request[1] = 0x01; // Start routine
-        request[2] = (byte) 0xD0;
-        request[3] = 0x10;
-        System.arraycopy(keyData, 0, request, 4, keyData.length);
-        conn.getProtocol().sendRequest(request);
-        conn.getProtocol().readResponse();
-    }
-
-    @Override
-    public void deleteKey(int keySlot) throws IOException {
-        if (keySlot < 1 || keySlot > 4) {
-            throw new IllegalArgumentException("Key slot must be 1-4, got: " + keySlot);
-        }
-
-        EcuConnection conn = connections.get(CAS_ID);
-
-        // Engineering session
-        conn.getProtocol().sendRequest(new byte[]{0x10, 0x02});
-        conn.getProtocol().readResponse();
-        conn.getProtocol().sendRequest(new byte[]{0x27, 0x61});
-        conn.getProtocol().readResponse();
-        conn.getProtocol().sendRequest(new byte[]{0x27, 0x62, 0x00, 0x00, 0x00, 0x00});
-        conn.getProtocol().readResponse();
-
-        // Delete key in specified slot
-        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, (byte) 0xD0, 0x20, (byte) keySlot});
-        conn.getProtocol().readResponse();
     }
 
     @Override
@@ -136,21 +64,60 @@ public class BmwSecuritySystem extends SecuritySystem {
     }
 
     @Override
-    public void alignImmobilizer() throws IOException {
+    public int readKeyCount() throws IOException {
+        EcuConnection conn = connections.get(CAS_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0xD000));
+        byte[] response = conn.getProtocol().readResponse();
+        return response.length > 3 ? response[3] & 0xFF : 0;
+    }
+
+    @Override
+    public void programNewKey(byte[] keyData) throws IOException {
+        if (keyData == null || keyData.length == 0) {
+            throw new IllegalArgumentException("Key data must not be null or empty");
+        }
+
         EcuConnection conn = connections.get(CAS_ID);
 
-        // Extended session
-        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        // Enter programming session
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x02});
         conn.getProtocol().readResponse();
 
-        // Engineering security access
+        // Engineering-level security access (0x61/0x62)
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x61});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x62, 0x00, 0x00, 0x00, 0x00});
         conn.getProtocol().readResponse();
 
-        // ISN alignment routine: synchronize CAS ISN with DME ISN
-        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, (byte) 0xD0, 0x30});
+        // Write key data via routine control
+        byte[] request = new byte[4 + keyData.length];
+        request[0] = 0x31; // RoutineControl
+        request[1] = 0x01; // Start routine
+        request[2] = (byte) 0xD0;
+        request[3] = 0x10;
+        System.arraycopy(keyData, 0, request, 4, keyData.length);
+        conn.getProtocol().sendRequest(request);
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public void deleteKey(int keyIndex) throws IOException {
+        if (keyIndex < 0 || keyIndex > 3) {
+            throw new IllegalArgumentException("Key index must be 0-3, got: " + keyIndex);
+        }
+
+        EcuConnection conn = connections.get(CAS_ID);
+
+        // Engineering session
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x02});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x61});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x62, 0x00, 0x00, 0x00, 0x00});
+        conn.getProtocol().readResponse();
+
+        // Delete key in specified slot
+        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, (byte) 0xD0, 0x20, (byte) (keyIndex + 1)});
         conn.getProtocol().readResponse();
     }
 
@@ -172,31 +139,59 @@ public class BmwSecuritySystem extends SecuritySystem {
     }
 
     @Override
-    public void writeAlarmConfig(Map<String, String> settings) throws IOException {
+    public void setAlarmSensitivity(int level) throws IOException {
+        if (level < 1 || level > 10) {
+            throw new IllegalArgumentException("Sensitivity must be 1-10, got: " + level);
+        }
+
         EcuConnection conn = connections.get(CAS_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
         conn.getProtocol().readResponse();
 
-        byte flags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("Alarm Active"))) flags |= 0x01;
-        if ("Enabled".equalsIgnoreCase(settings.get("Tilt Alarm"))) flags |= 0x02;
-        if ("Enabled".equalsIgnoreCase(settings.get("Interior Motion"))) flags |= 0x04;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, (byte) 0xD0, 0x41, (byte) level});
+        conn.getProtocol().readResponse();
+    }
 
-        int sensitivity = 3;
-        if (settings.containsKey("Sensitivity")) {
-            sensitivity = Integer.parseInt(settings.get("Sensitivity"));
+    @Override
+    public void setTiltSensor(boolean enabled) throws IOException {
+        EcuConnection conn = connections.get(CAS_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
+        conn.getProtocol().readResponse();
+
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, (byte) 0xD0, 0x42, val});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public Map<String, String> readKeylessEntryConfig() throws IOException {
+        EcuConnection conn = connections.get(CAS_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0xD020));
+        byte[] response = conn.getProtocol().readResponse();
+
+        Map<String, String> config = new LinkedHashMap<>();
+        if (response.length > 3) {
+            config.put("Comfort Access", (response[3] & 0x01) != 0 ? "Enabled" : "Disabled");
+            config.put("Keyless Go", (response[3] & 0x02) != 0 ? "Enabled" : "Disabled");
+            config.put("Auto Relock", (response[3] & 0x04) != 0 ? "Enabled" : "Disabled");
         }
+        return config;
+    }
 
-        int duration = 30;
-        if (settings.containsKey("Siren Duration Seconds")) {
-            duration = Integer.parseInt(settings.get("Siren Duration Seconds"));
-        }
+    @Override
+    public void setKeylessEntry(boolean enabled) throws IOException {
+        EcuConnection conn = connections.get(CAS_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
+        conn.getProtocol().readResponse();
 
-        conn.getProtocol().sendRequest(new byte[]{
-                0x2E, (byte) 0xD0, 0x40, flags, (byte) sensitivity, (byte) duration
-        });
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, (byte) 0xD0, 0x22, val});
         conn.getProtocol().readResponse();
     }
 

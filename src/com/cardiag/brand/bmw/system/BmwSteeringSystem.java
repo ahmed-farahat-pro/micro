@@ -12,7 +12,7 @@ import java.util.*;
 /**
  * BMW steering system implementation using the ELV/EPS ECU.
  * Provides active steering configuration, servotronic assist curve
- * programming, steering calibration, and angle sensor reads.
+ * programming, steering calibration, torque reading, and speed-dependent assist.
  */
 public class BmwSteeringSystem extends SteeringSystem {
 
@@ -32,12 +32,13 @@ public class BmwSteeringSystem extends SteeringSystem {
     @Override
     public List<String> getCapabilities() {
         return Arrays.asList(
+                "Steering Assist Mode Read",
+                "Steering Assist Level Configuration",
                 "Active Steering Configuration",
-                "Servotronic Assist Curve Programming",
+                "Steering Angle Calibration",
+                "Steering Torque Read",
                 "Speed-Dependent Assist Toggle",
-                "Steering Calibration",
-                "Steering Angle Read",
-                "Variable Ratio Steering"
+                "Servotronic Assist Curves"
         );
     }
 
@@ -47,90 +48,71 @@ public class BmwSteeringSystem extends SteeringSystem {
     }
 
     @Override
-    public Map<String, String> readSteeringConfig() throws IOException {
+    public String readSteeringAssistMode() throws IOException {
         EcuConnection conn = connections.get(ELV_ID);
         conn.getProtocol().sendRequest(buildReadDid(0x8001));
         byte[] response = conn.getProtocol().readResponse();
 
+        if (response.length > 3) {
+            switch (response[3] & 0xFF) {
+                case 0x01: return "Comfort";
+                case 0x02: return "Normal";
+                case 0x03: return "Sport";
+                default: return "Unknown";
+            }
+        }
+        return "Unknown";
+    }
+
+    @Override
+    public void setSteeringAssistLevel(int level) throws IOException {
+        if (level < 0 || level > 10) {
+            throw new IllegalArgumentException("Level must be 0-10, got: " + level);
+        }
+
+        EcuConnection conn = connections.get(ELV_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
+        conn.getProtocol().readResponse();
+
+        conn.getProtocol().sendRequest(new byte[]{0x2E, (byte) 0x80, 0x03, (byte) level});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public Map<String, String> readActiveSteering() throws IOException {
+        EcuConnection conn = connections.get(ELV_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0x8002));
+        byte[] response = conn.getProtocol().readResponse();
+
         Map<String, String> config = new LinkedHashMap<>();
         if (response.length > 6) {
-            config.put("EPS Variant", decodeEpsVariant(response[3] & 0xFF));
+            config.put("Active Steering Installed", (response[3] & 0x01) != 0 ? "Yes" : "No");
+            config.put("Variable Ratio", (response[3] & 0x02) != 0 ? "Enabled" : "Disabled");
             config.put("Servotronic Active", (response[4] & 0x01) != 0 ? "Yes" : "No");
-            config.put("Servotronic Sport Mode", (response[4] & 0x02) != 0 ? "Yes" : "No");
-            config.put("Active Steering", (response[5] & 0x01) != 0 ? "Yes" : "No");
-            config.put("Speed Dependent Assist", (response[6] & 0x01) != 0 ? "Yes" : "No");
-            config.put("Variable Ratio", (response[6] & 0x02) != 0 ? "Yes" : "No");
+            config.put("Sport Mode", (response[4] & 0x02) != 0 ? "Yes" : "No");
+            config.put("Speed Dependent Assist", (response[5] & 0x01) != 0 ? "Enabled" : "Disabled");
+            config.put("Return to Center Force", String.valueOf(response[6] & 0xFF));
         }
         return config;
     }
 
     @Override
-    public void writeSteeringConfig(Map<String, String> settings) throws IOException {
+    public void setActiveSteering(boolean enabled) throws IOException {
         EcuConnection conn = connections.get(ELV_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
         conn.getProtocol().readResponse();
 
-        byte servoFlags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("Servotronic Active"))) servoFlags |= 0x01;
-        if ("Yes".equalsIgnoreCase(settings.get("Servotronic Sport Mode"))) servoFlags |= 0x02;
-
-        byte activeSteer = "Yes".equalsIgnoreCase(settings.get("Active Steering")) ? (byte) 0x01 : 0x00;
-
-        byte assistFlags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("Speed Dependent Assist"))) assistFlags |= 0x01;
-        if ("Yes".equalsIgnoreCase(settings.get("Variable Ratio"))) assistFlags |= 0x02;
-
-        conn.getProtocol().sendRequest(new byte[]{
-                0x2E, (byte) 0x80, 0x01,
-                0x01, servoFlags, activeSteer, assistFlags
-        });
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, (byte) 0x80, 0x04, val});
         conn.getProtocol().readResponse();
     }
 
     @Override
-    public Map<String, String> readAssistCurve() throws IOException {
-        EcuConnection conn = connections.get(ELV_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x8002));
-        byte[] response = conn.getProtocol().readResponse();
-
-        Map<String, String> curve = new LinkedHashMap<>();
-        if (response.length > 8) {
-            curve.put("Low Speed Assist %", String.valueOf(response[3] & 0xFF));
-            curve.put("Mid Speed Assist %", String.valueOf(response[4] & 0xFF));
-            curve.put("High Speed Assist %", String.valueOf(response[5] & 0xFF));
-            curve.put("Comfort Curve ID", String.valueOf(response[6] & 0xFF));
-            curve.put("Sport Curve ID", String.valueOf(response[7] & 0xFF));
-            curve.put("Return to Center Force", String.valueOf(response[8] & 0xFF));
-        }
-        return curve;
-    }
-
-    @Override
-    public void writeAssistCurve(Map<String, String> curve) throws IOException {
-        EcuConnection conn = connections.get(ELV_ID);
-        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
-        conn.getProtocol().readResponse();
-        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
-        conn.getProtocol().readResponse();
-
-        byte lowSpeed = parseByte(curve.getOrDefault("Low Speed Assist %", "100"));
-        byte midSpeed = parseByte(curve.getOrDefault("Mid Speed Assist %", "70"));
-        byte highSpeed = parseByte(curve.getOrDefault("High Speed Assist %", "40"));
-        byte comfortId = parseByte(curve.getOrDefault("Comfort Curve ID", "1"));
-        byte sportId = parseByte(curve.getOrDefault("Sport Curve ID", "2"));
-        byte returnForce = parseByte(curve.getOrDefault("Return to Center Force", "50"));
-
-        conn.getProtocol().sendRequest(new byte[]{
-                0x2E, (byte) 0x80, 0x02,
-                lowSpeed, midSpeed, highSpeed, comfortId, sportId, returnForce
-        });
-        conn.getProtocol().readResponse();
-    }
-
-    @Override
-    public void calibrateSteering() throws IOException {
+    public void calibrateSteeringAngle() throws IOException {
         EcuConnection conn = connections.get(ELV_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
@@ -143,38 +125,30 @@ public class BmwSteeringSystem extends SteeringSystem {
     }
 
     @Override
-    public Map<String, Double> readSteeringAngles() throws IOException {
+    public double readSteeringTorque() throws IOException {
         EcuConnection conn = connections.get(ELV_ID);
         conn.getProtocol().sendRequest(buildReadDid(0x8010));
         byte[] response = conn.getProtocol().readResponse();
 
-        Map<String, Double> angles = new LinkedHashMap<>();
-        if (response.length > 8) {
-            angles.put("Steering Wheel Angle deg", extractSignedAngle(response, 3));
-            angles.put("Steering Wheel Rate deg/s", extractSignedAngle(response, 5));
-            angles.put("Road Wheel Angle deg", extractSignedAngle(response, 7));
+        if (response.length > 4) {
+            int raw = ((response[3] & 0xFF) << 8) | (response[4] & 0xFF);
+            if (raw > 32767) raw -= 65536;
+            return raw / 100.0; // Nm
         }
-        return angles;
+        return 0.0;
     }
 
-    private static double extractSignedAngle(byte[] data, int offset) {
-        int raw = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-        if (raw > 32767) raw -= 65536;
-        return raw / 10.0;
-    }
+    @Override
+    public void setSpeedDependentAssist(boolean enabled) throws IOException {
+        EcuConnection conn = connections.get(ELV_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
+        conn.getProtocol().readResponse();
 
-    private static String decodeEpsVariant(int val) {
-        switch (val) {
-            case 0x01: return "Standard EPS";
-            case 0x02: return "Sport EPS";
-            case 0x03: return "Active Steering";
-            case 0x04: return "Integral Active Steering";
-            default: return "Unknown (0x" + Integer.toHexString(val) + ")";
-        }
-    }
-
-    private static byte parseByte(String value) {
-        return (byte) (Integer.parseInt(value.replaceAll("[^0-9]", "")) & 0xFF);
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, (byte) 0x80, 0x05, val});
+        conn.getProtocol().readResponse();
     }
 
     private static byte[] buildReadDid(int did) {

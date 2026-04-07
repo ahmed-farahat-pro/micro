@@ -39,7 +39,8 @@ public class BmwLightingSystem extends LightingSystem {
                 "Fog Light as Cornering Light",
                 "LED Tail Light Coding",
                 "Adaptive Headlight Configuration",
-                "Brake Force Display"
+                "Brake Force Display",
+                "Footwell Light Color"
         );
     }
 
@@ -49,7 +50,7 @@ public class BmwLightingSystem extends LightingSystem {
     }
 
     @Override
-    public Map<String, String> readDrlConfig() throws IOException {
+    public Map<String, String> readHeadlightConfig() throws IOException {
         EcuConnection conn = connections.get(FRM_ID);
         conn.getProtocol().sendRequest(buildReadDid(0x3001));
         byte[] response = conn.getProtocol().readResponse();
@@ -60,25 +61,23 @@ public class BmwLightingSystem extends LightingSystem {
             config.put("DRL Brightness", (response[4] & 0xFF) + "%");
             config.put("Angel Eyes Active", (response[3] & 0x02) != 0 ? "Yes" : "No");
             config.put("Angel Eyes as DRL", (response[3] & 0x04) != 0 ? "Yes" : "No");
+            config.put("Adaptive Headlights", (response[5] & 0x01) != 0 ? "Enabled" : "Disabled");
+            config.put("Welcome Lights", (response[5] & 0x02) != 0 ? "Enabled" : "Disabled");
+            config.put("Cornering Lights", (response[5] & 0x04) != 0 ? "Enabled" : "Disabled");
         }
         return config;
     }
 
     @Override
-    public void writeDrlConfig(Map<String, String> settings) throws IOException {
+    public void setDaytimeRunningLights(boolean enabled, int brightness) throws IOException {
+        if (brightness < 0 || brightness > 100) {
+            throw new IllegalArgumentException("Brightness must be 0-100, got: " + brightness);
+        }
+
         EcuConnection conn = connections.get(FRM_ID);
         enterCodingSession(conn);
 
-        byte flags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("DRL Active"))) flags |= 0x01;
-        if ("Yes".equalsIgnoreCase(settings.get("Angel Eyes Active"))) flags |= 0x02;
-        if ("Yes".equalsIgnoreCase(settings.get("Angel Eyes as DRL"))) flags |= 0x04;
-
-        int brightness = 100;
-        if (settings.containsKey("DRL Brightness")) {
-            brightness = Integer.parseInt(settings.get("DRL Brightness").replace("%", ""));
-        }
-
+        byte flags = enabled ? (byte) 0x01 : 0x00;
         conn.getProtocol().sendRequest(new byte[]{
                 0x2E, 0x30, 0x01, flags, (byte) brightness
         });
@@ -86,97 +85,104 @@ public class BmwLightingSystem extends LightingSystem {
     }
 
     @Override
-    public Map<String, String> readWelcomeLightConfig() throws IOException {
+    public void setAdaptiveHeadlights(boolean enabled) throws IOException {
         EcuConnection conn = connections.get(FRM_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x3010));
+        enterCodingSession(conn);
+
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x13, val});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public void setWelcomeLights(boolean enabled) throws IOException {
+        EcuConnection conn = connections.get(FRM_ID);
+        enterCodingSession(conn);
+
+        byte flags = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x10, flags, 0x0A});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public void setCorneringLights(boolean enabled) throws IOException {
+        EcuConnection conn = connections.get(FRM_ID);
+        enterCodingSession(conn);
+
+        byte flags = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x11, flags});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public Map<String, String> readTailLightConfig() throws IOException {
+        EcuConnection conn = connections.get(FRM_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0x3014));
         byte[] response = conn.getProtocol().readResponse();
 
         Map<String, String> config = new LinkedHashMap<>();
         if (response.length > 4) {
-            config.put("Welcome Lights Active", (response[3] & 0x01) != 0 ? "Yes" : "No");
-            config.put("Duration Seconds", String.valueOf(response[4] & 0xFF));
-            config.put("Pathway Lighting", (response[3] & 0x02) != 0 ? "Yes" : "No");
+            config.put("LED Tail Coding", (response[3] & 0x01) != 0 ? "Enabled" : "Disabled");
+            config.put("Brake Force Display", (response[3] & 0x02) != 0 ? "Enabled" : "Disabled");
+            config.put("Brake Light Intensity %", String.valueOf(response[4] & 0xFF));
         }
         return config;
     }
 
     @Override
-    public void writeWelcomeLightConfig(Map<String, String> settings) throws IOException {
+    public void setBrakeLightIntensity(int intensity) throws IOException {
+        if (intensity < 0 || intensity > 100) {
+            throw new IllegalArgumentException("Intensity must be 0-100, got: " + intensity);
+        }
+
         EcuConnection conn = connections.get(FRM_ID);
         enterCodingSession(conn);
 
-        byte flags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("Welcome Lights Active"))) flags |= 0x01;
-        if ("Yes".equalsIgnoreCase(settings.get("Pathway Lighting"))) flags |= 0x02;
-
-        int duration = 10;
-        if (settings.containsKey("Duration Seconds")) {
-            duration = Integer.parseInt(settings.get("Duration Seconds"));
-        }
-
-        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x10, flags, (byte) duration});
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x14, (byte) intensity});
         conn.getProtocol().readResponse();
     }
 
     @Override
-    public Map<String, String> readCorneringLightConfig() throws IOException {
-        EcuConnection conn = connections.get(FRM_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x3011));
-        byte[] response = conn.getProtocol().readResponse();
-
-        Map<String, String> config = new LinkedHashMap<>();
-        if (response.length > 3) {
-            config.put("Cornering Lights Active", (response[3] & 0x01) != 0 ? "Yes" : "No");
-            config.put("Fog as Cornering", (response[3] & 0x02) != 0 ? "Yes" : "No");
-            config.put("Activation Speed km/h", response.length > 4 ? String.valueOf(response[4] & 0xFF) : "40");
-        }
-        return config;
-    }
-
-    @Override
-    public void writeCorneringLightConfig(Map<String, String> settings) throws IOException {
+    public void setFogLightAsCorneringLight(boolean enabled) throws IOException {
         EcuConnection conn = connections.get(FRM_ID);
         enterCodingSession(conn);
 
-        byte flags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("Cornering Lights Active"))) flags |= 0x01;
-        if ("Yes".equalsIgnoreCase(settings.get("Fog as Cornering"))) flags |= 0x02;
-
-        int speed = 40;
-        if (settings.containsKey("Activation Speed km/h")) {
-            speed = Integer.parseInt(settings.get("Activation Speed km/h"));
-        }
-
-        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x11, flags, (byte) speed});
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x15, val});
         conn.getProtocol().readResponse();
     }
 
     @Override
-    public Map<String, String> readFogLightConfig() throws IOException {
+    public Map<String, String> readInteriorLightConfig() throws IOException {
         EcuConnection conn = connections.get(FRM_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x3012));
+        conn.getProtocol().sendRequest(buildReadDid(0x3016));
         byte[] response = conn.getProtocol().readResponse();
 
         Map<String, String> config = new LinkedHashMap<>();
-        if (response.length > 3) {
-            config.put("Front Fog Lights Installed", (response[3] & 0x01) != 0 ? "Yes" : "No");
-            config.put("Rear Fog Light", (response[3] & 0x02) != 0 ? "Yes" : "No");
-            config.put("Fog Light Auto Off", (response[3] & 0x04) != 0 ? "Yes" : "No");
+        if (response.length > 6) {
+            config.put("Footwell Lights", (response[3] & 0x01) != 0 ? "Enabled" : "Disabled");
+            int color = ((response[4] & 0xFF) << 16) | ((response[5] & 0xFF) << 8) | (response[6] & 0xFF);
+            config.put("Footwell Color", String.format("#%06X", color));
+            config.put("Ambient Lighting", (response[3] & 0x02) != 0 ? "Enabled" : "Disabled");
         }
         return config;
     }
 
     @Override
-    public void writeFogLightConfig(Map<String, String> settings) throws IOException {
+    public void setFootwellLights(boolean enabled, int color) throws IOException {
+        if (color < 0 || color > 0xFFFFFF) {
+            throw new IllegalArgumentException("Color must be 0x000000-0xFFFFFF");
+        }
+
         EcuConnection conn = connections.get(FRM_ID);
         enterCodingSession(conn);
 
-        byte flags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("Front Fog Lights Installed"))) flags |= 0x01;
-        if ("Yes".equalsIgnoreCase(settings.get("Rear Fog Light"))) flags |= 0x02;
-        if ("Yes".equalsIgnoreCase(settings.get("Fog Light Auto Off"))) flags |= 0x04;
+        byte flags = enabled ? (byte) 0x01 : 0x00;
+        byte r = (byte) ((color >> 16) & 0xFF);
+        byte g = (byte) ((color >> 8) & 0xFF);
+        byte b = (byte) (color & 0xFF);
 
-        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x12, flags});
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x30, 0x16, flags, r, g, b});
         conn.getProtocol().readResponse();
     }
 

@@ -11,8 +11,8 @@ import java.util.*;
 
 /**
  * BMW brake system implementation using the DSC ECU.
- * Provides DSC coding, brake bleed routines, CBS brake pad reset,
- * and parking brake calibration.
+ * Provides ABS/ESP configuration, brake bleed routines, CBS brake pad reset,
+ * parking brake calibration, fluid level read, and brake pre-fill control.
  */
 public class BmwBrakeSystem extends BrakeSystem {
 
@@ -32,13 +32,14 @@ public class BmwBrakeSystem extends BrakeSystem {
     @Override
     public List<String> getCapabilities() {
         return Arrays.asList(
-                "DSC Configuration Read/Write",
-                "ABS Status Read",
-                "Brake Bleed Routine (per corner)",
+                "ABS Configuration Read",
+                "ESP Configuration Read/Set",
+                "Brake Bleed Routine (per circuit)",
                 "CBS Brake Pad Wear Reset",
+                "Brake Pad Status Read",
                 "Electronic Parking Brake Calibration",
-                "Hill Start Assist Configuration",
-                "Brake Data Read"
+                "Brake Fluid Level Read",
+                "Brake Pre-Fill Toggle"
         );
     }
 
@@ -48,7 +49,26 @@ public class BmwBrakeSystem extends BrakeSystem {
     }
 
     @Override
-    public Map<String, String> readBrakeConfig() throws IOException {
+    public Map<String, String> readAbsConfig() throws IOException {
+        EcuConnection conn = connections.get(DSC_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0x7001));
+        byte[] response = conn.getProtocol().readResponse();
+
+        Map<String, String> config = new LinkedHashMap<>();
+        if (response.length > 6) {
+            config.put("ABS Status", (response[3] & 0x01) != 0 ? "OK" : "Fault");
+            config.put("Sensor FL", (response[4] & 0x01) != 0 ? "OK" : "Fault");
+            config.put("Sensor FR", (response[4] & 0x02) != 0 ? "OK" : "Fault");
+            config.put("Sensor RL", (response[4] & 0x04) != 0 ? "OK" : "Fault");
+            config.put("Sensor RR", (response[4] & 0x08) != 0 ? "OK" : "Fault");
+            config.put("Hydraulic Unit", (response[5] & 0x01) != 0 ? "OK" : "Fault");
+            config.put("Pressure Sensor", (response[6] & 0x01) != 0 ? "OK" : "Fault");
+        }
+        return config;
+    }
+
+    @Override
+    public Map<String, String> readEspConfig() throws IOException {
         EcuConnection conn = connections.get(DSC_ID);
         conn.getProtocol().sendRequest(buildReadDid(0x7000));
         byte[] response = conn.getProtocol().readResponse();
@@ -57,7 +77,6 @@ public class BmwBrakeSystem extends BrakeSystem {
         if (response.length > 7) {
             config.put("DSC Active", (response[3] & 0x01) != 0 ? "Yes" : "No");
             config.put("DTC Mode Available", (response[3] & 0x02) != 0 ? "Yes" : "No");
-            config.put("ABS Active", (response[3] & 0x04) != 0 ? "Yes" : "No");
             config.put("CBC Active", (response[4] & 0x01) != 0 ? "Yes" : "No");
             config.put("DBC Active", (response[4] & 0x02) != 0 ? "Yes" : "No");
             config.put("Hill Start Assist", (response[5] & 0x01) != 0 ? "Enabled" : "Disabled");
@@ -71,61 +90,43 @@ public class BmwBrakeSystem extends BrakeSystem {
     }
 
     @Override
-    public void writeBrakeConfig(Map<String, String> settings) throws IOException {
+    public void setEspMode(String mode) throws IOException {
+        if (mode == null) {
+            throw new IllegalArgumentException("Mode must not be null");
+        }
+
         EcuConnection conn = connections.get(DSC_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
         conn.getProtocol().readResponse();
 
-        byte dscFlags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("DSC Active"))) dscFlags |= 0x01;
-        if ("Yes".equalsIgnoreCase(settings.get("DTC Mode Available"))) dscFlags |= 0x02;
-        if ("Yes".equalsIgnoreCase(settings.get("ABS Active"))) dscFlags |= 0x04;
+        byte modeCode;
+        switch (mode.toLowerCase()) {
+            case "on": modeCode = 0x01; break;
+            case "sport": case "dtc": modeCode = 0x02; break;
+            case "off": modeCode = 0x00; break;
+            default: throw new IllegalArgumentException("Unknown ESP mode: " + mode);
+        }
 
-        byte brakeFlags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("CBC Active"))) brakeFlags |= 0x01;
-        if ("Yes".equalsIgnoreCase(settings.get("DBC Active"))) brakeFlags |= 0x02;
-
-        byte assistFlags = 0;
-        if ("Enabled".equalsIgnoreCase(settings.get("Hill Start Assist"))) assistFlags |= 0x01;
-        if ("Enabled".equalsIgnoreCase(settings.get("Brake Drying"))) assistFlags |= 0x02;
-        if ("Enabled".equalsIgnoreCase(settings.get("Brake Standby"))) assistFlags |= 0x04;
-
-        byte fadeFlag = "Enabled".equalsIgnoreCase(settings.get("Fading Compensation")) ? (byte) 0x01 : 0x00;
-
-        byte epbFlags = 0;
-        if ("Yes".equalsIgnoreCase(settings.get("EPB Active"))) epbFlags |= 0x01;
-        if ("Enabled".equalsIgnoreCase(settings.get("EPB Auto Hold"))) epbFlags |= 0x02;
-
-        conn.getProtocol().sendRequest(new byte[]{
-                0x2E, 0x70, 0x00,
-                dscFlags, brakeFlags, assistFlags, fadeFlag, epbFlags
-        });
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x70, 0x01, modeCode});
         conn.getProtocol().readResponse();
     }
 
     @Override
-    public void performBrakeBleed(String corner) throws IOException {
+    public void performBrakeBleed(int circuit) throws IOException {
+        if (circuit < 1 || circuit > 2) {
+            throw new IllegalArgumentException("Circuit must be 1 or 2, got: " + circuit);
+        }
+
         EcuConnection conn = connections.get(DSC_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
         conn.getProtocol().readResponse();
 
-        byte cornerCode;
-        switch (corner.toUpperCase()) {
-            case "FL": case "FRONT_LEFT": cornerCode = 0x01; break;
-            case "FR": case "FRONT_RIGHT": cornerCode = 0x02; break;
-            case "RL": case "REAR_LEFT": cornerCode = 0x03; break;
-            case "RR": case "REAR_RIGHT": cornerCode = 0x04; break;
-            case "ALL": cornerCode = 0x00; break;
-            default:
-                throw new IllegalArgumentException("Unknown corner: " + corner);
-        }
-
-        // Start brake bleed routine
-        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, 0x70, 0x10, cornerCode});
+        // Start brake bleed routine for specified circuit
+        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, 0x70, 0x10, (byte) circuit});
         conn.getProtocol().readResponse();
     }
 
@@ -145,6 +146,22 @@ public class BmwBrakeSystem extends BrakeSystem {
     }
 
     @Override
+    public Map<String, Integer> readBrakePadStatus() throws IOException {
+        EcuConnection conn = connections.get(DSC_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0x7002));
+        byte[] response = conn.getProtocol().readResponse();
+
+        Map<String, Integer> status = new LinkedHashMap<>();
+        if (response.length > 6) {
+            status.put("Front Left %", response[3] & 0xFF);
+            status.put("Front Right %", response[4] & 0xFF);
+            status.put("Rear Left %", response[5] & 0xFF);
+            status.put("Rear Right %", response[6] & 0xFF);
+        }
+        return status;
+    }
+
+    @Override
     public void calibrateParkingBrake() throws IOException {
         EcuConnection conn = connections.get(DSC_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
@@ -158,45 +175,33 @@ public class BmwBrakeSystem extends BrakeSystem {
     }
 
     @Override
-    public Map<String, Double> readBrakeData() throws IOException {
+    public String readBrakeFluidLevel() throws IOException {
         EcuConnection conn = connections.get(DSC_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x7010));
+        conn.getProtocol().sendRequest(buildReadDid(0x7020));
         byte[] response = conn.getProtocol().readResponse();
 
-        Map<String, Double> data = new LinkedHashMap<>();
-        if (response.length > 12) {
-            data.put("Brake Pressure bar", extractDouble(response, 3));
-            data.put("Wheel Speed FL km/h", extractDouble(response, 5));
-            data.put("Wheel Speed FR km/h", extractDouble(response, 7));
-            data.put("Wheel Speed RL km/h", extractDouble(response, 9));
-            data.put("Wheel Speed RR km/h", extractDouble(response, 11));
+        if (response.length > 3) {
+            switch (response[3] & 0xFF) {
+                case 0x00: return "OK";
+                case 0x01: return "Low";
+                case 0x02: return "Critical - service immediately";
+                default: return "Unknown";
+            }
         }
-        return data;
+        return "Unknown";
     }
 
     @Override
-    public Map<String, String> readAbsStatus() throws IOException {
+    public void setPrefillBrakes(boolean enabled) throws IOException {
         EcuConnection conn = connections.get(DSC_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x7001));
-        byte[] response = conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
+        conn.getProtocol().readResponse();
 
-        Map<String, String> status = new LinkedHashMap<>();
-        if (response.length > 6) {
-            status.put("ABS Status", (response[3] & 0x01) != 0 ? "OK" : "Fault");
-            status.put("DSC Status", (response[3] & 0x02) != 0 ? "OK" : "Fault");
-            status.put("Sensor FL", (response[4] & 0x01) != 0 ? "OK" : "Fault");
-            status.put("Sensor FR", (response[4] & 0x02) != 0 ? "OK" : "Fault");
-            status.put("Sensor RL", (response[4] & 0x04) != 0 ? "OK" : "Fault");
-            status.put("Sensor RR", (response[4] & 0x08) != 0 ? "OK" : "Fault");
-            status.put("Hydraulic Unit", (response[5] & 0x01) != 0 ? "OK" : "Fault");
-            status.put("Pressure Sensor", (response[6] & 0x01) != 0 ? "OK" : "Fault");
-        }
-        return status;
-    }
-
-    private static double extractDouble(byte[] data, int offset) {
-        if (data == null || offset + 1 >= data.length) return 0.0;
-        return (((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF)) / 100.0;
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x70, 0x02, val});
+        conn.getProtocol().readResponse();
     }
 
     private static byte[] buildReadDid(int did) {

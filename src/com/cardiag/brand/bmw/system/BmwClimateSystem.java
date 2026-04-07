@@ -11,8 +11,8 @@ import java.util.*;
 
 /**
  * BMW climate system implementation using the IHKA ECU.
- * Provides auto start/stop climate control, residual heat configuration,
- * seat heating stage control, and temperature monitoring.
+ * Provides auto climate control, compressor management, seat heating
+ * stage configuration, steering wheel heating, and residual heat.
  */
 public class BmwClimateSystem extends ClimateSystem {
 
@@ -32,12 +32,13 @@ public class BmwClimateSystem extends ClimateSystem {
     @Override
     public List<String> getCapabilities() {
         return Arrays.asList(
-                "Auto Climate Configuration",
-                "AC Compressor Auto-Off with Engine Stop",
-                "Residual Heat Configuration",
+                "Auto Climate Toggle",
+                "Max Cooling Power Configuration",
                 "Seat Heating Stage Configuration",
-                "Temperature Sensor Read",
-                "Recirculation Mode Configuration"
+                "Steering Wheel Heating Toggle",
+                "Residual Heat Configuration",
+                "Compressor Status Read",
+                "Temperature Sensor Read"
         );
     }
 
@@ -65,32 +66,15 @@ public class BmwClimateSystem extends ClimateSystem {
     }
 
     @Override
-    public void writeClimateConfig(Map<String, String> settings) throws IOException {
+    public void setAutoClimate(boolean enabled) throws IOException {
         EcuConnection conn = connections.get(IHKA_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
         conn.getProtocol().readResponse();
 
-        byte mainFlags = 0;
-        if ("Enabled".equalsIgnoreCase(settings.get("Auto Climate"))) mainFlags |= 0x01;
-        if ("Enabled".equalsIgnoreCase(settings.get("Dual Zone"))) mainFlags |= 0x02;
-        if ("Enabled".equalsIgnoreCase(settings.get("AC Off with Engine Stop"))) mainFlags |= 0x04;
-
-        byte heatFlags = 0;
-        if ("Enabled".equalsIgnoreCase(settings.get("Residual Heat"))) heatFlags |= 0x01;
-
-        int heatDuration = 15;
-        if (settings.containsKey("Residual Heat Duration min")) {
-            heatDuration = Integer.parseInt(settings.get("Residual Heat Duration min"));
-        }
-
-        byte recirc = 0;
-        if ("Enabled".equalsIgnoreCase(settings.get("Recirculation Auto"))) recirc = 0x01;
-
-        conn.getProtocol().sendRequest(new byte[]{
-                0x2E, 0x60, 0x00, mainFlags, heatFlags, (byte) heatDuration, recirc
-        });
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x60, 0x01, val});
         conn.getProtocol().readResponse();
     }
 
@@ -110,57 +94,96 @@ public class BmwClimateSystem extends ClimateSystem {
     }
 
     @Override
-    public Map<String, String> readSeatHeatingConfig() throws IOException {
-        EcuConnection conn = connections.get(IHKA_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x6010));
-        byte[] response = conn.getProtocol().readResponse();
-
-        Map<String, String> config = new LinkedHashMap<>();
-        if (response.length > 5) {
-            config.put("Seat Heating Stages", String.valueOf(response[3] & 0xFF));
-            config.put("Auto Off Enabled", (response[4] & 0x01) != 0 ? "Yes" : "No");
-            config.put("Steering Wheel Heating", (response[5] & 0x01) != 0 ? "Installed" : "Not Installed");
+    public void setMaxCoolingPower(int percent) throws IOException {
+        if (percent < 0 || percent > 100) {
+            throw new IllegalArgumentException("Percent must be 0-100, got: " + percent);
         }
-        return config;
-    }
 
-    @Override
-    public void writeSeatHeatingConfig(Map<String, String> settings) throws IOException {
         EcuConnection conn = connections.get(IHKA_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
         conn.getProtocol().readResponse();
 
-        int stages = 3;
-        if (settings.containsKey("Seat Heating Stages")) {
-            stages = Integer.parseInt(settings.get("Seat Heating Stages"));
-        }
-        byte autoOff = "Yes".equalsIgnoreCase(settings.get("Auto Off Enabled")) ? (byte) 0x01 : 0x00;
-
-        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x60, 0x10, (byte) stages, autoOff});
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x60, 0x02, (byte) percent});
         conn.getProtocol().readResponse();
     }
 
     @Override
-    public Map<String, Double> readTemperatures() throws IOException {
+    public Map<String, Integer> readSeatHeatingLevels() throws IOException {
         EcuConnection conn = connections.get(IHKA_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x6002));
+        conn.getProtocol().sendRequest(buildReadDid(0x6010));
         byte[] response = conn.getProtocol().readResponse();
 
-        Map<String, Double> temps = new LinkedHashMap<>();
-        if (response.length > 10) {
-            temps.put("Interior", extractTemp(response, 3));
-            temps.put("Exterior", extractTemp(response, 5));
-            temps.put("Evaporator", extractTemp(response, 7));
-            temps.put("Coolant", extractTemp(response, 9));
+        Map<String, Integer> levels = new LinkedHashMap<>();
+        if (response.length > 6) {
+            levels.put("Driver", response[3] & 0xFF);
+            levels.put("Passenger", response[4] & 0xFF);
+            levels.put("Rear Left", response[5] & 0xFF);
+            levels.put("Rear Right", response[6] & 0xFF);
         }
-        return temps;
+        return levels;
     }
 
-    private static double extractTemp(byte[] data, int offset) {
-        int raw = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-        return (raw - 4000) / 100.0; // BMW temperature encoding: offset by 40.00 C
+    @Override
+    public void setSeatHeatingStages(int stages) throws IOException {
+        if (stages < 1 || stages > 5) {
+            throw new IllegalArgumentException("Stages must be 1-5, got: " + stages);
+        }
+
+        EcuConnection conn = connections.get(IHKA_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
+        conn.getProtocol().readResponse();
+
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x60, 0x10, (byte) stages});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public Map<String, String> readSteeringWheelHeating() throws IOException {
+        EcuConnection conn = connections.get(IHKA_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0x6020));
+        byte[] response = conn.getProtocol().readResponse();
+
+        Map<String, String> config = new LinkedHashMap<>();
+        if (response.length > 4) {
+            config.put("Installed", (response[3] & 0x01) != 0 ? "Yes" : "No");
+            config.put("Active", (response[3] & 0x02) != 0 ? "Yes" : "No");
+            config.put("Level", String.valueOf(response[4] & 0xFF));
+        }
+        return config;
+    }
+
+    @Override
+    public void setSteeringWheelHeating(boolean enabled) throws IOException {
+        EcuConnection conn = connections.get(IHKA_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
+        conn.getProtocol().readResponse();
+
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x60, 0x20, val});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public void setResidualHeat(boolean enabled, int durationMin) throws IOException {
+        if (durationMin <= 0) {
+            throw new IllegalArgumentException("Duration must be positive, got: " + durationMin);
+        }
+
+        EcuConnection conn = connections.get(IHKA_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
+        conn.getProtocol().readResponse();
+
+        byte flag = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x60, 0x03, flag, (byte) durationMin});
+        conn.getProtocol().readResponse();
     }
 
     private static byte[] buildReadDid(int did) {
