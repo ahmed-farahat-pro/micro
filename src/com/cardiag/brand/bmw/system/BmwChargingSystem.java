@@ -12,7 +12,8 @@ import java.util.*;
 /**
  * BMW charging and battery management system implementation.
  * Uses the DME ECU for IBS (Intelligent Battery Sensor) access,
- * alternator coding, and regenerative braking configuration.
+ * alternator coding, regenerative braking configuration, HV battery
+ * health, and charging schedule management.
  */
 public class BmwChargingSystem extends ChargingSystem {
 
@@ -32,12 +33,13 @@ public class BmwChargingSystem extends ChargingSystem {
     @Override
     public List<String> getCapabilities() {
         return Arrays.asList(
-                "Battery Status Read (IBS)",
-                "Battery Registration",
-                "Alternator Configuration",
+                "Battery Management Read (IBS)",
+                "Charging Status Read",
+                "Charging Limit Configuration",
+                "Alternator Output Read",
                 "Regenerative Braking Configuration",
-                "Charging History Read",
-                "Energy Recovery Data Read"
+                "HV Battery Health Read",
+                "Charging Schedule Configuration"
         );
     }
 
@@ -47,7 +49,7 @@ public class BmwChargingSystem extends ChargingSystem {
     }
 
     @Override
-    public Map<String, String> readBatteryStatus() throws IOException {
+    public Map<String, String> readBatteryManagement() throws IOException {
         EcuConnection conn = connections.get(DME_ID);
         conn.getProtocol().sendRequest(buildReadDid(0x2500));
         byte[] response = conn.getProtocol().readResponse();
@@ -58,48 +60,51 @@ public class BmwChargingSystem extends ChargingSystem {
             status.put("Voltage V", String.format("%.2f", voltage / 1000.0));
 
             int current = ((response[5] & 0xFF) << 8) | (response[6] & 0xFF);
-            if (current > 32767) current -= 65536; // signed
+            if (current > 32767) current -= 65536;
             status.put("Current A", String.format("%.2f", current / 100.0));
 
             status.put("State of Charge %", String.valueOf(response[7] & 0xFF));
             status.put("State of Health %", String.valueOf(response[8] & 0xFF));
-
-            int temp = response[9] & 0xFF;
-            status.put("Temperature C", String.valueOf(temp - 40));
-
+            status.put("Temperature C", String.valueOf((response[9] & 0xFF) - 40));
             status.put("Battery Registered", (response[10] & 0x01) != 0 ? "Yes" : "No");
         }
         return status;
     }
 
     @Override
-    public void registerBattery(String partNumber, int capacityAh) throws IOException {
+    public Map<String, String> readChargingStatus() throws IOException {
+        EcuConnection conn = connections.get(DME_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0x2540));
+        byte[] response = conn.getProtocol().readResponse();
+
+        Map<String, String> status = new LinkedHashMap<>();
+        if (response.length > 6) {
+            status.put("Charging Active", (response[3] & 0x01) != 0 ? "Yes" : "No");
+            int chargeRate = ((response[4] & 0xFF) << 8) | (response[5] & 0xFF);
+            status.put("Charge Rate W", String.valueOf(chargeRate));
+            status.put("Estimated Time to Full min", String.valueOf(response[6] & 0xFF));
+        }
+        return status;
+    }
+
+    @Override
+    public void setChargingLimit(int percent) throws IOException {
+        if (percent < 50 || percent > 100) {
+            throw new IllegalArgumentException("Charging limit must be 50-100%, got: " + percent);
+        }
+
         EcuConnection conn = connections.get(DME_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x03});
         conn.getProtocol().readResponse();
 
-        // BMW battery registration: write part number and capacity
-        byte[] pnBytes = partNumber.getBytes();
-        byte[] request = new byte[5 + pnBytes.length];
-        request[0] = 0x2E;
-        request[1] = 0x25;
-        request[2] = 0x10;
-        request[3] = (byte) ((capacityAh >> 8) & 0xFF);
-        request[4] = (byte) (capacityAh & 0xFF);
-        System.arraycopy(pnBytes, 0, request, 5, pnBytes.length);
-
-        conn.getProtocol().sendRequest(request);
-        conn.getProtocol().readResponse();
-
-        // Reset IBS learned values after battery registration
-        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, 0x25, 0x01});
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x25, 0x41, (byte) percent});
         conn.getProtocol().readResponse();
     }
 
     @Override
-    public Map<String, String> readAlternatorConfig() throws IOException {
+    public Map<String, String> readAlternatorOutput() throws IOException {
         EcuConnection conn = connections.get(DME_ID);
         conn.getProtocol().sendRequest(buildReadDid(0x2510));
         byte[] response = conn.getProtocol().readResponse();
@@ -116,87 +121,83 @@ public class BmwChargingSystem extends ChargingSystem {
     }
 
     @Override
-    public void writeAlternatorConfig(Map<String, String> settings) throws IOException {
+    public void setRegenerativeBraking(int level) throws IOException {
+        if (level < 0 || level > 3) {
+            throw new IllegalArgumentException("Regenerative braking level must be 0-3, got: " + level);
+        }
+
         EcuConnection conn = connections.get(DME_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x03});
         conn.getProtocol().readResponse();
 
-        // Parse target voltage (e.g. "14.40" -> 14400)
-        int targetVoltage = 14400;
-        if (settings.containsKey("Target Voltage V")) {
-            targetVoltage = (int) (Double.parseDouble(settings.get("Target Voltage V")) * 1000);
-        }
-
-        byte chargeFlags = 0;
-        if ("Active".equalsIgnoreCase(settings.get("Intelligent Charging"))) chargeFlags |= 0x01;
-        if ("Active".equalsIgnoreCase(settings.get("Regenerative Mode"))) chargeFlags |= 0x02;
-
-        int loadResponse = 100;
-        if (settings.containsKey("Load Response %")) {
-            loadResponse = Integer.parseInt(settings.get("Load Response %"));
-        }
-
-        conn.getProtocol().sendRequest(new byte[]{
-                0x2E, 0x25, 0x10,
-                (byte) ((targetVoltage >> 8) & 0xFF),
-                (byte) (targetVoltage & 0xFF),
-                chargeFlags,
-                (byte) (loadResponse & 0xFF)
-        });
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x25, 0x30, (byte) level});
         conn.getProtocol().readResponse();
     }
 
     @Override
-    public Map<String, String> readChargingHistory() throws IOException {
+    public Map<String, String> readHvBatteryHealth() throws IOException {
         EcuConnection conn = connections.get(DME_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x2520));
+        conn.getProtocol().sendRequest(buildReadDid(0x2550));
         byte[] response = conn.getProtocol().readResponse();
 
-        Map<String, String> history = new LinkedHashMap<>();
-        if (response.length > 10) {
-            int totalChargeAh = ((response[3] & 0xFF) << 8) | (response[4] & 0xFF);
-            history.put("Total Charge Throughput Ah", String.valueOf(totalChargeAh));
-
-            int deepDischarges = response[5] & 0xFF;
-            history.put("Deep Discharge Events", String.valueOf(deepDischarges));
-
-            int batteryAge = ((response[6] & 0xFF) << 8) | (response[7] & 0xFF);
-            history.put("Battery Age days", String.valueOf(batteryAge));
-
-            int avgTemp = response[8] & 0xFF;
-            history.put("Average Temperature C", String.valueOf(avgTemp - 40));
-
-            int maxTemp = response[9] & 0xFF;
-            history.put("Max Temperature C", String.valueOf(maxTemp - 40));
-
-            int minVoltage = ((response[10] & 0xFF) << 8) | (response.length > 11 ? (response[11] & 0xFF) : 0);
-            history.put("Min Voltage V", String.format("%.2f", minVoltage / 1000.0));
+        Map<String, String> health = new LinkedHashMap<>();
+        if (response.length > 8) {
+            health.put("SOH %", String.valueOf(response[3] & 0xFF));
+            int cycles = ((response[4] & 0xFF) << 8) | (response[5] & 0xFF);
+            health.put("Cycle Count", String.valueOf(cycles));
+            health.put("Degradation %", String.valueOf(response[6] & 0xFF));
+            int maxCapacity = ((response[7] & 0xFF) << 8) | (response[8] & 0xFF);
+            health.put("Max Capacity kWh", String.format("%.1f", maxCapacity / 10.0));
         }
-        return history;
+        return health;
     }
 
     @Override
-    public Map<String, Double> readEnergyRecoveryData() throws IOException {
-        EcuConnection conn = connections.get(DME_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x2530));
-        byte[] response = conn.getProtocol().readResponse();
-
-        Map<String, Double> data = new LinkedHashMap<>();
-        if (response.length > 10) {
-            data.put("Regenerative Power kW", extractDouble(response, 3));
-            data.put("Energy Recovered kWh", extractDouble(response, 5));
-            data.put("Regeneration Duty Cycle %", (double) (response[7] & 0xFF));
-            data.put("Alternator Efficiency %", (double) (response[8] & 0xFF));
-            data.put("Battery Charging Rate A", extractDouble(response, 9));
+    public void setChargingSchedule(String schedule) throws IOException {
+        if (schedule == null || schedule.isEmpty()) {
+            throw new IllegalArgumentException("Schedule must not be null or empty");
         }
-        return data;
-    }
 
-    private static double extractDouble(byte[] data, int offset) {
-        if (data == null || offset + 1 >= data.length) return 0.0;
-        return (((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF)) / 100.0;
+        EcuConnection conn = connections.get(DME_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x03});
+        conn.getProtocol().readResponse();
+
+        // Parse schedule: e.g. "daily:23:00-06:00" or "weekdays:01:00-05:00"
+        byte scheduleType;
+        if (schedule.startsWith("weekdays")) {
+            scheduleType = 0x01;
+        } else if (schedule.startsWith("weekends")) {
+            scheduleType = 0x02;
+        } else {
+            scheduleType = 0x00; // daily
+        }
+
+        // Extract times from schedule string
+        String[] parts = schedule.split(":");
+        byte startHour = 0x17; // default 23
+        byte startMin = 0x00;
+        byte endHour = 0x06;
+        byte endMin = 0x00;
+
+        if (parts.length >= 3) {
+            try {
+                startHour = (byte) Integer.parseInt(parts[1]);
+                String endPart = parts[2].contains("-") ? parts[2].split("-")[1] : parts[2];
+                endHour = (byte) Integer.parseInt(endPart);
+            } catch (NumberFormatException ignored) {
+                // Use defaults
+            }
+        }
+
+        conn.getProtocol().sendRequest(new byte[]{
+                0x2E, 0x25, 0x42,
+                scheduleType, startHour, startMin, endHour, endMin
+        });
+        conn.getProtocol().readResponse();
     }
 
     private static byte[] buildReadDid(int did) {

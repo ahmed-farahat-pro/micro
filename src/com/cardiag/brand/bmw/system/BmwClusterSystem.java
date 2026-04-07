@@ -11,8 +11,8 @@ import java.util.*;
 
 /**
  * BMW instrument cluster system implementation using the KOMBI ECU.
- * Provides language, units, oil/inspection service reset, needle sweep
- * configuration, and speed warning coding.
+ * Provides language, units, oil/inspection service reset, needle sweep,
+ * speed warning, mileage reading, and date/time format configuration.
  */
 public class BmwClusterSystem extends InstrumentClusterSystem {
 
@@ -33,14 +33,13 @@ public class BmwClusterSystem extends InstrumentClusterSystem {
     public List<String> getCapabilities() {
         return Arrays.asList(
                 "Language Configuration",
-                "Units Configuration (km/h, mph, Celsius, Fahrenheit)",
+                "Units Configuration (metric/imperial)",
                 "Oil Service Reset",
                 "Inspection Service Reset",
-                "Needle Sweep Toggle",
-                "Digital Speedo Toggle",
+                "Needle Sweep Test",
                 "Speed Warning Configuration",
-                "Date/Time Format",
-                "Service History Read"
+                "Mileage Read",
+                "Date/Time Format Configuration"
         );
     }
 
@@ -70,35 +69,39 @@ public class BmwClusterSystem extends InstrumentClusterSystem {
     }
 
     @Override
-    public void writeClusterConfig(Map<String, String> settings) throws IOException {
+    public void setLanguage(String lang) throws IOException {
+        if (lang == null) {
+            throw new IllegalArgumentException("Language must not be null");
+        }
+
         EcuConnection conn = connections.get(KOMBI_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
         conn.getProtocol().readResponse();
 
-        byte lang = encodeLanguage(settings.getOrDefault("Language", "English"));
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x40, 0x10, encodeLanguage(lang)});
+        conn.getProtocol().readResponse();
+    }
 
-        byte units = 0;
-        if ("mph".equalsIgnoreCase(settings.get("Speed Units"))) units |= 0x01;
-        if ("Fahrenheit".equalsIgnoreCase(settings.get("Temperature Units"))) units |= 0x02;
-
-        byte fuelUnits = encodeFuelUnits(settings.getOrDefault("Fuel Consumption Units", "L/100km"));
-
-        byte display = 0;
-        if ("Enabled".equalsIgnoreCase(settings.get("Needle Sweep"))) display |= 0x01;
-        if ("Enabled".equalsIgnoreCase(settings.get("Digital Speedo"))) display |= 0x02;
-
-        byte warning = "Yes".equalsIgnoreCase(settings.get("Speed Warning Active")) ? (byte) 0x01 : 0x00;
-        byte threshold = 0x78; // 120 km/h default
-        if (settings.containsKey("Speed Warning Threshold km/h")) {
-            threshold = (byte) (Integer.parseInt(settings.get("Speed Warning Threshold km/h")) & 0xFF);
+    @Override
+    public void setUnits(String unitSystem) throws IOException {
+        if (unitSystem == null) {
+            throw new IllegalArgumentException("Unit system must not be null");
         }
 
-        conn.getProtocol().sendRequest(new byte[]{
-                0x2E, 0x40, 0x00,
-                lang, units, fuelUnits, display, warning, threshold
-        });
+        EcuConnection conn = connections.get(KOMBI_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
+        conn.getProtocol().readResponse();
+
+        byte unitFlags = 0;
+        if ("imperial".equalsIgnoreCase(unitSystem)) {
+            unitFlags = 0x03; // mph + Fahrenheit
+        }
+
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x40, 0x11, unitFlags});
         conn.getProtocol().readResponse();
     }
 
@@ -116,7 +119,7 @@ public class BmwClusterSystem extends InstrumentClusterSystem {
     }
 
     @Override
-    public void resetInspection() throws IOException {
+    public void resetInspectionService() throws IOException {
         EcuConnection conn = connections.get(KOMBI_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
@@ -129,91 +132,71 @@ public class BmwClusterSystem extends InstrumentClusterSystem {
     }
 
     @Override
-    public Map<String, String> readServiceHistory() throws IOException {
+    public void performNeedleSweep() throws IOException {
         EcuConnection conn = connections.get(KOMBI_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x4000));
-        byte[] response = conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
 
-        Map<String, String> history = new LinkedHashMap<>();
+        // Trigger needle sweep test routine
+        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, 0x40, 0x10});
+        conn.getProtocol().readResponse();
+    }
 
-        // Read oil service data
-        conn.getProtocol().sendRequest(buildReadDid(0x4001));
-        byte[] oilResp = conn.getProtocol().readResponse();
-        if (oilResp.length > 6) {
-            int oilKm = ((oilResp[3] & 0xFF) << 8) | (oilResp[4] & 0xFF);
-            int oilDays = ((oilResp[5] & 0xFF) << 8) | (oilResp[6] & 0xFF);
-            history.put("Oil Service Remaining km", String.valueOf(oilKm * 100));
-            history.put("Oil Service Remaining days", String.valueOf(oilDays));
+    @Override
+    public void setSpeedWarning(int speed) throws IOException {
+        if (speed < 0) {
+            throw new IllegalArgumentException("Speed must be non-negative, got: " + speed);
         }
 
-        // Read inspection data
-        conn.getProtocol().sendRequest(buildReadDid(0x4002));
-        byte[] inspResp = conn.getProtocol().readResponse();
-        if (inspResp.length > 6) {
-            int inspKm = ((inspResp[3] & 0xFF) << 8) | (inspResp[4] & 0xFF);
-            int inspDays = ((inspResp[5] & 0xFF) << 8) | (inspResp[6] & 0xFF);
-            history.put("Inspection Remaining km", String.valueOf(inspKm * 100));
-            history.put("Inspection Remaining days", String.valueOf(inspDays));
-        }
+        EcuConnection conn = connections.get(KOMBI_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
+        conn.getProtocol().readResponse();
 
-        // Read total mileage
+        byte active = speed > 0 ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{
+                0x2E, 0x40, 0x12, active, (byte) (speed & 0xFF)
+        });
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public long readMileage() throws IOException {
+        EcuConnection conn = connections.get(KOMBI_ID);
         conn.getProtocol().sendRequest(buildReadDid(0x4003));
-        byte[] mileResp = conn.getProtocol().readResponse();
-        if (mileResp.length > 6) {
-            long mileage = ((mileResp[3] & 0xFFL) << 24) | ((mileResp[4] & 0xFFL) << 16)
-                    | ((mileResp[5] & 0xFFL) << 8) | (mileResp[6] & 0xFFL);
-            history.put("Total Mileage km", String.valueOf(mileage));
+        byte[] response = conn.getProtocol().readResponse();
+
+        if (response.length > 6) {
+            return ((response[3] & 0xFFL) << 24) | ((response[4] & 0xFFL) << 16)
+                    | ((response[5] & 0xFFL) << 8) | (response[6] & 0xFFL);
+        }
+        return 0;
+    }
+
+    @Override
+    public void setDateTimeFormat(String format) throws IOException {
+        if (format == null) {
+            throw new IllegalArgumentException("Format must not be null");
         }
 
-        return history;
-    }
-
-    @Override
-    public String readLanguage() throws IOException {
-        EcuConnection conn = connections.get(KOMBI_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x4000));
-        byte[] response = conn.getProtocol().readResponse();
-        return response.length > 3 ? decodeLanguage(response[3] & 0xFF) : "Unknown";
-    }
-
-    @Override
-    public void setLanguage(String language) throws IOException {
         EcuConnection conn = connections.get(KOMBI_ID);
         conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
         conn.getProtocol().readResponse();
         conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
         conn.getProtocol().readResponse();
 
-        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x40, 0x10, encodeLanguage(language)});
-        conn.getProtocol().readResponse();
-    }
-
-    @Override
-    public String readUnits() throws IOException {
-        EcuConnection conn = connections.get(KOMBI_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0x4000));
-        byte[] response = conn.getProtocol().readResponse();
-        if (response.length > 4) {
-            boolean isMph = (response[4] & 0x01) != 0;
-            boolean isFahr = (response[4] & 0x02) != 0;
-            return (isMph ? "mph" : "km/h") + " / " + (isFahr ? "Fahrenheit" : "Celsius");
+        byte timeFmt = format.contains("12h") ? (byte) 0x00 : (byte) 0x01; // 24h default
+        byte dateFmt;
+        if (format.contains("MM/dd")) {
+            dateFmt = 0x02; // US format
+        } else if (format.contains("yyyy")) {
+            dateFmt = 0x03; // ISO format
+        } else {
+            dateFmt = 0x01; // DD.MM.YYYY European default
         }
-        return "Unknown";
-    }
 
-    @Override
-    public void setUnits(String units) throws IOException {
-        EcuConnection conn = connections.get(KOMBI_ID);
-        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
-        conn.getProtocol().readResponse();
-        conn.getProtocol().sendRequest(new byte[]{0x27, 0x01});
-        conn.getProtocol().readResponse();
-
-        byte unitFlags = 0;
-        if (units.toLowerCase().contains("mph")) unitFlags |= 0x01;
-        if (units.toLowerCase().contains("fahrenheit")) unitFlags |= 0x02;
-
-        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x40, 0x11, unitFlags});
+        conn.getProtocol().sendRequest(new byte[]{0x2E, 0x40, 0x13, timeFmt, dateFmt});
         conn.getProtocol().readResponse();
     }
 
@@ -221,39 +204,39 @@ public class BmwClusterSystem extends InstrumentClusterSystem {
 
     private static String decodeLanguage(int code) {
         switch (code) {
-            case 0x00: return "German";
-            case 0x01: return "English";
-            case 0x02: return "French";
-            case 0x03: return "Italian";
-            case 0x04: return "Spanish";
-            case 0x05: return "Portuguese";
-            case 0x06: return "Dutch";
-            case 0x07: return "Turkish";
-            case 0x08: return "Japanese";
-            case 0x09: return "Chinese";
-            case 0x0A: return "Korean";
-            case 0x0B: return "Arabic";
-            case 0x0C: return "Russian";
-            default: return "Unknown (" + code + ")";
+            case 0x00: return "de";
+            case 0x01: return "en";
+            case 0x02: return "fr";
+            case 0x03: return "it";
+            case 0x04: return "es";
+            case 0x05: return "pt";
+            case 0x06: return "nl";
+            case 0x07: return "tr";
+            case 0x08: return "ja";
+            case 0x09: return "zh";
+            case 0x0A: return "ko";
+            case 0x0B: return "ar";
+            case 0x0C: return "ru";
+            default: return "unknown";
         }
     }
 
-    private static byte encodeLanguage(String language) {
-        switch (language.toLowerCase()) {
-            case "german": return 0x00;
-            case "english": return 0x01;
-            case "french": return 0x02;
-            case "italian": return 0x03;
-            case "spanish": return 0x04;
-            case "portuguese": return 0x05;
-            case "dutch": return 0x06;
-            case "turkish": return 0x07;
-            case "japanese": return 0x08;
-            case "chinese": return 0x09;
-            case "korean": return 0x0A;
-            case "arabic": return 0x0B;
-            case "russian": return 0x0C;
-            default: return 0x01; // Default to English
+    private static byte encodeLanguage(String lang) {
+        switch (lang.toLowerCase()) {
+            case "de": case "german": return 0x00;
+            case "en": case "english": return 0x01;
+            case "fr": case "french": return 0x02;
+            case "it": case "italian": return 0x03;
+            case "es": case "spanish": return 0x04;
+            case "pt": case "portuguese": return 0x05;
+            case "nl": case "dutch": return 0x06;
+            case "tr": case "turkish": return 0x07;
+            case "ja": case "japanese": return 0x08;
+            case "zh": case "chinese": return 0x09;
+            case "ko": case "korean": return 0x0A;
+            case "ar": case "arabic": return 0x0B;
+            case "ru": case "russian": return 0x0C;
+            default: throw new IllegalArgumentException("Unsupported language: " + lang);
         }
     }
 
@@ -264,16 +247,6 @@ public class BmwClusterSystem extends InstrumentClusterSystem {
             case 0x02: return "MPG (US)";
             case 0x03: return "MPG (UK)";
             default: return "Unknown";
-        }
-    }
-
-    private static byte encodeFuelUnits(String units) {
-        switch (units.toLowerCase()) {
-            case "l/100km": return 0x00;
-            case "km/l": return 0x01;
-            case "mpg (us)": case "mpg": return 0x02;
-            case "mpg (uk)": return 0x03;
-            default: return 0x00;
         }
     }
 

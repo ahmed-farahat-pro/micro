@@ -11,9 +11,8 @@ import java.util.*;
 
 /**
  * BMW ADAS system implementation using the KAFAS camera module.
- * Provides camera calibration, lane departure warning sensitivity
- * adjustment, forward collision warning configuration, and traffic
- * sign recognition settings.
+ * Provides camera calibration, radar calibration, lane departure warning,
+ * forward collision warning, adaptive cruise control, and parking assist.
  */
 public class BmwAdasSystem extends AdasSystem {
 
@@ -34,12 +33,11 @@ public class BmwAdasSystem extends AdasSystem {
     public List<String> getCapabilities() {
         return Arrays.asList(
                 "Camera Calibration",
-                "Lane Departure Warning Configuration",
+                "Radar Calibration",
+                "Lane Departure Warning Toggle",
                 "Forward Collision Warning Configuration",
-                "City Braking Toggle",
-                "Pedestrian Warning Toggle",
-                "Traffic Sign Recognition Toggle",
-                "High Beam Assistant Toggle",
+                "Adaptive Cruise Control Toggle",
+                "Parking Assist Configuration Read",
                 "Calibration Status Read"
         );
     }
@@ -50,73 +48,7 @@ public class BmwAdasSystem extends AdasSystem {
     }
 
     @Override
-    public Map<String, String> readAdasConfig() throws IOException {
-        EcuConnection conn = connections.get(KAFAS_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0xB001));
-        byte[] response = conn.getProtocol().readResponse();
-
-        Map<String, String> config = new LinkedHashMap<>();
-        if (response.length > 8) {
-            config.put("Lane Departure Warning", (response[3] & 0x01) != 0 ? "Active" : "Inactive");
-            config.put("LDW Sensitivity", decodeSensitivity(response[4] & 0xFF));
-            config.put("LDW Warning Type", (response[5] & 0x01) == 0 ? "Visual" : "Steering Vibration");
-            config.put("Forward Collision Warning", (response[5] & 0x02) != 0 ? "Active" : "Inactive");
-            config.put("FCW Sensitivity", decodeSensitivity(response[6] & 0xFF));
-            config.put("City Braking", (response[7] & 0x01) != 0 ? "Active" : "Inactive");
-            config.put("Pedestrian Warning", (response[7] & 0x02) != 0 ? "Active" : "Inactive");
-            config.put("Traffic Sign Recognition", (response[7] & 0x04) != 0 ? "Active" : "Inactive");
-            config.put("High Beam Assistant", (response[8] & 0x01) != 0 ? "Active" : "Inactive");
-        }
-        return config;
-    }
-
-    @Override
-    public void writeAdasConfig(Map<String, String> settings) throws IOException {
-        EcuConnection conn = connections.get(KAFAS_ID);
-        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
-        conn.getProtocol().readResponse();
-        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
-        conn.getProtocol().readResponse();
-
-        byte ldwFlag = "Active".equalsIgnoreCase(settings.get("Lane Departure Warning")) ? (byte) 0x01 : 0x00;
-        byte ldwSens = encodeSensitivity(settings.getOrDefault("LDW Sensitivity", "Medium"));
-
-        byte warningFlags = 0;
-        if ("Steering Vibration".equalsIgnoreCase(settings.get("LDW Warning Type"))) warningFlags |= 0x01;
-        if ("Active".equalsIgnoreCase(settings.get("Forward Collision Warning"))) warningFlags |= 0x02;
-
-        byte fcwSens = encodeSensitivity(settings.getOrDefault("FCW Sensitivity", "Medium"));
-
-        byte featureFlags = 0;
-        if ("Active".equalsIgnoreCase(settings.get("City Braking"))) featureFlags |= 0x01;
-        if ("Active".equalsIgnoreCase(settings.get("Pedestrian Warning"))) featureFlags |= 0x02;
-        if ("Active".equalsIgnoreCase(settings.get("Traffic Sign Recognition"))) featureFlags |= 0x04;
-
-        byte hba = "Active".equalsIgnoreCase(settings.get("High Beam Assistant")) ? (byte) 0x01 : 0x00;
-
-        conn.getProtocol().sendRequest(new byte[]{
-                0x2E, (byte) 0xB0, 0x01,
-                ldwFlag, ldwSens, warningFlags, fcwSens, featureFlags, hba
-        });
-        conn.getProtocol().readResponse();
-    }
-
-    @Override
-    public void calibrateCamera() throws IOException {
-        EcuConnection conn = connections.get(KAFAS_ID);
-        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
-        conn.getProtocol().readResponse();
-        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
-        conn.getProtocol().readResponse();
-
-        // Start camera calibration routine
-        // Vehicle must be on a level surface facing a calibration target
-        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, (byte) 0xB0, 0x10});
-        conn.getProtocol().readResponse();
-    }
-
-    @Override
-    public Map<String, String> readCalibrationStatus() throws IOException {
+    public Map<String, String> readCameraCalibration() throws IOException {
         EcuConnection conn = connections.get(KAFAS_ID);
         conn.getProtocol().sendRequest(buildReadDid(0xB000));
         byte[] response = conn.getProtocol().readResponse();
@@ -132,41 +64,110 @@ public class BmwAdasSystem extends AdasSystem {
     }
 
     @Override
-    public Map<String, String> readSensorStatus() throws IOException {
+    public void calibrateCamera() throws IOException {
         EcuConnection conn = connections.get(KAFAS_ID);
-        conn.getProtocol().sendRequest(buildReadDid(0xB002));
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
+        conn.getProtocol().readResponse();
+
+        // Start camera calibration routine
+        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, (byte) 0xB0, 0x10});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public Map<String, String> readRadarConfig() throws IOException {
+        EcuConnection conn = connections.get(KAFAS_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0xB010));
         byte[] response = conn.getProtocol().readResponse();
 
-        Map<String, String> status = new LinkedHashMap<>();
+        Map<String, String> config = new LinkedHashMap<>();
         if (response.length > 5) {
-            status.put("Camera Status", (response[3] & 0x01) != 0 ? "OK" : "Fault");
-            status.put("Lens Clean", (response[3] & 0x02) != 0 ? "Yes" : "Blocked/Dirty");
-            status.put("Temperature OK", (response[4] & 0x01) != 0 ? "Yes" : "Overheated");
-            status.put("Firmware Version", String.format("%d.%d", response[5] & 0xFF,
-                    response.length > 6 ? response[6] & 0xFF : 0));
+            config.put("Radar Installed", (response[3] & 0x01) != 0 ? "Yes" : "No");
+            config.put("Radar Calibrated", (response[3] & 0x02) != 0 ? "Yes" : "No");
+            config.put("Range m", String.valueOf(response[4] & 0xFF));
+            config.put("ACC Available", (response[5] & 0x01) != 0 ? "Yes" : "No");
         }
-        return status;
+        return config;
+    }
+
+    @Override
+    public void setLaneDepartureWarning(boolean enabled) throws IOException {
+        EcuConnection conn = connections.get(KAFAS_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
+        conn.getProtocol().readResponse();
+
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, (byte) 0xB0, 0x01, val});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public void setCollisionWarning(boolean enabled, int sensitivity) throws IOException {
+        if (sensitivity < 1 || sensitivity > 3) {
+            throw new IllegalArgumentException("Sensitivity must be 1-3, got: " + sensitivity);
+        }
+
+        EcuConnection conn = connections.get(KAFAS_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
+        conn.getProtocol().readResponse();
+
+        byte enableFlag = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{
+                0x2E, (byte) 0xB0, 0x02, enableFlag, (byte) sensitivity
+        });
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public void setAdaptiveCruise(boolean enabled) throws IOException {
+        EcuConnection conn = connections.get(KAFAS_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
+        conn.getProtocol().readResponse();
+
+        byte val = enabled ? (byte) 0x01 : 0x00;
+        conn.getProtocol().sendRequest(new byte[]{0x2E, (byte) 0xB0, 0x03, val});
+        conn.getProtocol().readResponse();
+    }
+
+    @Override
+    public Map<String, String> readParkingAssistConfig() throws IOException {
+        EcuConnection conn = connections.get(KAFAS_ID);
+        conn.getProtocol().sendRequest(buildReadDid(0xB020));
+        byte[] response = conn.getProtocol().readResponse();
+
+        Map<String, String> config = new LinkedHashMap<>();
+        if (response.length > 5) {
+            config.put("PDC Front", (response[3] & 0x01) != 0 ? "Installed" : "Not Installed");
+            config.put("PDC Rear", (response[3] & 0x02) != 0 ? "Installed" : "Not Installed");
+            config.put("Parking Assistant", (response[4] & 0x01) != 0 ? "Active" : "Inactive");
+            config.put("Surround View", (response[4] & 0x02) != 0 ? "Active" : "Inactive");
+            config.put("Rear Camera", (response[5] & 0x01) != 0 ? "Active" : "Inactive");
+        }
+        return config;
+    }
+
+    @Override
+    public void calibrateRadar() throws IOException {
+        EcuConnection conn = connections.get(KAFAS_ID);
+        conn.getProtocol().sendRequest(new byte[]{0x10, 0x03});
+        conn.getProtocol().readResponse();
+        conn.getProtocol().sendRequest(new byte[]{0x27, 0x05});
+        conn.getProtocol().readResponse();
+
+        // Start radar calibration routine
+        conn.getProtocol().sendRequest(new byte[]{0x31, 0x01, (byte) 0xB0, 0x11});
+        conn.getProtocol().readResponse();
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
-
-    private static String decodeSensitivity(int val) {
-        switch (val) {
-            case 0x01: return "Low";
-            case 0x02: return "Medium";
-            case 0x03: return "High";
-            default: return "Unknown";
-        }
-    }
-
-    private static byte encodeSensitivity(String sens) {
-        switch (sens.toLowerCase()) {
-            case "low": return 0x01;
-            case "medium": return 0x02;
-            case "high": return 0x03;
-            default: return 0x02;
-        }
-    }
 
     private static String decodeQuality(int val) {
         if (val >= 90) return "Excellent";
